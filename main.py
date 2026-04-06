@@ -51,27 +51,36 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-# Depends(verify_token) means this route requires a valid JWT
+
+# mock
+MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() == "true"
+
 @app.post("/chat")
 async def chat(request: ChatRequest, user=Depends(verify_token)):
     check_rate_limit(user["sub"])
     log_and_check_anomaly(user["sub"], request.message)
     
-    # check semantic cache first
     cached = check_semantic_cache(request.message)
     if cached:
         return {"response": cached, "cached": True}
     
-    try:
-        response = client.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=request.message
-        )
-        # store in cache for future similar requests
-        add_to_cache(request.message, response.text)
-        return {"response": response.text, "cached": False}
-    except Exception as e:
-        return {"error": str(e)}
+    if MOCK_LLM:
+        response_text = f"Mock response to: {request.message}"
+    else:
+        try:
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=request.message
+            )
+            response_text = response.text
+        except Exception as e:
+            return {"error": str(e)}
+    
+    add_to_cache(request.message, response_text)
+    return {"response": response_text, "cached": False}
+    
+    
+    
     
 # connect to Redis for rate limiting
 redis_client = redis.Redis(host="localhost", port=6379, db=0)
