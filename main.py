@@ -15,6 +15,9 @@ import numpy as np
 import json
 from datetime import datetime
 
+from sentence_transformers import SentenceTransformer
+import faiss
+
 
 load_dotenv()
 
@@ -53,12 +56,20 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 async def chat(request: ChatRequest, user=Depends(verify_token)):
     check_rate_limit(user["sub"])
     log_and_check_anomaly(user["sub"], request.message)
+    
+    # check semantic cache first
+    cached = check_semantic_cache(request.message)
+    if cached:
+        return {"response": cached, "cached": True}
+    
     try:
         response = client.models.generate_content(
             model="gemini-3-flash-preview",
             contents=request.message
         )
-        return {"response": response.text}
+        # store in cache for future similar requests
+        add_to_cache(request.message, response.text)
+        return {"response": response.text, "cached": False}
     except Exception as e:
         return {"error": str(e)}
     
@@ -114,5 +125,43 @@ def log_and_check_anomaly(user_id: str, message: str):
     if prediction[0] == -1:
         print(f"ANOMALY DETECTED: user={user_id}, hour={features['hour']}, prompt_length={features['prompt_length']}")
         
+# semantic cache setup
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")  # small, fast embedding model
+embedding_dim = 384  # dimension of the vectors this model produces
+
+# FAISS index stores all the embedding vectors
+faiss_index = faiss.IndexFlatL2(embedding_dim)
+
+# stores the actual cached responses mapped to their index position
+cache_store = []  # list of {"prompt": ..., "response": ...}
+
+SIMILARITY_THRESHOLD = 0.92
+
+def check_semantic_cache(prompt: str):
+    if len(cache_store) == 0:
+        return None  # cache is empty, nothing to check
+    
+    # convert prompt to embedding vector
+    query_embedding = embedding_model.encode([prompt])
+    
+    # search FAISS for the closest cached prompt
+    distances, indices = faiss_index.search(query_embedding, k=1)
+    
+    closest_distance = distances[0][0]
+    closest_index = indices[0][0]
+    
+    # L2 distance — lower means more similar, 0 means identical
+    # we use 0.5 as threshold (roughly equivalent to 0.92 cosine similarity)
+    if closest_distance < 0.5:
+        print(f"CACHE HIT: '{prompt}' matched cached prompt '{cache_store[closest_index]['prompt']}'")
+        return cache_store[closest_index]["response"]
+    
+    return None  # no similar prompt found
+
+def add_to_cache(prompt: str, response: str):
+    embedding = embedding_model.encode([prompt])
+    faiss_index.add(embedding)
+    cache_store.append({"prompt": prompt, "response": response})
+    
         
 handler = Mangum(app)
