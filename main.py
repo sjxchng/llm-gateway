@@ -6,6 +6,8 @@ from google import genai
 from mangum import Mangum
 from jose import jwt, JWTError  # JWT creation and validation
 import os
+import redis
+import time
 
 load_dotenv()
 
@@ -42,6 +44,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 # Depends(verify_token) means this route requires a valid JWT
 @app.post("/chat")
 async def chat(request: ChatRequest, user=Depends(verify_token)):
+    check_rate_limit(user["sub"])  # user["sub"] is the user's API key
     try:
         response = client.models.generate_content(
             model="gemini-3-flash-preview",
@@ -51,4 +54,22 @@ async def chat(request: ChatRequest, user=Depends(verify_token)):
     except Exception as e:
         return {"error": str(e)}
 
+# connect to Redis for rate limiting
+redis_client = redis.Redis(host="localhost", port=6379, db=0)
+
+RATE_LIMIT = 20      # max requests
+WINDOW = 60          # per 60 seconds
+
+def check_rate_limit(user_id: str):
+    key = f"rate:{user_id}"
+    current = redis_client.get(key)
+    if current is None:
+        # first request — set counter to 1 with 60 second expiry
+        redis_client.setex(key, WINDOW, 1)
+    elif int(current) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again in a minute.")
+    else:
+        redis_client.incr(key)
+        
+        
 handler = Mangum(app)
