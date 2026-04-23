@@ -24,6 +24,10 @@ ALGORITHM = "HS256"                     # signing algorithm
 MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() == "true"
 security = HTTPBearer()                 # tells FastAPI to expect a Bearer token in the header
 
+# ---- request counters for benchmarking ----
+total_requests = 0
+cache_hits = 0
+
 # ---- DynamoDB — stores API keys instead of hardcoding them ----
 dynamodb = boto3.resource("dynamodb", region_name="us-east-2")
 api_keys_table = dynamodb.Table("llm-gateway-api-keys")
@@ -130,12 +134,16 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 @app.post("/chat")
 async def chat(request: ChatRequest, user=Depends(verify_token)):
-    check_rate_limit(user["sub"])           # enforce rate limit
+    global total_requests, cache_hits
+    total_requests += 1                              # track every request
+
+    check_rate_limit(user["sub"])                    # enforce rate limit
     log_and_check_anomaly(user["sub"], request.message)  # flag anomalies
 
     # return cached response if semantically similar prompt exists
     cached = check_semantic_cache(request.message)
     if cached:
+        cache_hits += 1                              # track cache hits
         return {"response": cached, "cached": True}
 
     if MOCK_LLM:
@@ -152,6 +160,17 @@ async def chat(request: ChatRequest, user=Depends(verify_token)):
 
     add_to_cache(request.message, response_text)
     return {"response": response_text, "cached": False}
+
+# ---- admin endpoints ----
+@app.get("/admin/stats")
+def get_stats():
+    # returns cache hit rate and request counts for benchmarking
+    hit_rate = (cache_hits / total_requests * 100) if total_requests > 0 else 0
+    return {
+        "total_requests": total_requests,
+        "cache_hits": cache_hits,
+        "cache_hit_rate": f"{hit_rate:.1f}%"
+    }
 
 # Lambda entry point — AWS looks for a variable named "handler"
 handler = Mangum(app)
